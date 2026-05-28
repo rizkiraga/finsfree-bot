@@ -48,7 +48,7 @@ LOG_LEVEL=info
 
 Ini adalah fitur terpenting yang harus dipahami. Bot beroperasi dalam dua mode:
 
-**Mode Multi-Grup (diutamakan):** Baca konfigurasi dari `data/groups.json`. Setiap grup memiliki `id` (slug), `groupId` (Telegram chat ID), `brand` (persona AI, kata terlarang, focus areas), `topics`, `schedule` (cron per tipe konten), dan `postDailyLimit`.
+**Mode Multi-Grup (diutamakan):** Baca konfigurasi dari `data/groups.json`. Setiap grup memiliki `id` (slug), `groupId` (Telegram chat ID), `brand` (persona AI, kata terlarang, focus areas), `topics`, `schedule` (cron per tipe konten), `postDailyLimit`, dan `newsEnabled`. Untuk analisis teknikal terjadwal, tambahkan blok opsional `analysis.schedules` — array berisi `{ symbol, timeframe, cron, label }`. Symbol yang didukung: `XAUUSD`, `EURUSD`, `GBPUSD`, `BTCUSD`; timeframe: `M15`, `H1`, `H4`, `D1`.
 
 **Mode Legacy (fallback):** Jika `data/groups.json` tidak ada, bot membaca `TELEGRAM_GROUP_ID` dari `.env` dan membangun satu grup sintetis dengan konfigurasi default Finsfree.
 
@@ -61,13 +61,15 @@ Ini adalah fitur terpenting yang harus dipahami. Bot beroperasi dalam dua mode:
 ```
 src/index.js
   ├─ src/config.js              → load & validasi .env
-  ├─ src/openai.js              → verifikasi koneksi OpenAI
+  ├─ src/openai.js              → verifikasi koneksi OpenAI (model: gpt-4o-mini)
   ├─ src/scheduler.js           → engine utama multi-grup
   │   ├─ config/groupsLoader.js → load semua grup
   │   ├─ Per-grup: groupStates Map
   │   │   ├─ content/generator.js        → generate konten marketing via AI
   │   │   ├─ content/analysisGenerator.js → generate analisis teknikal via AI
+  │   │   ├─ content/templates.js        → format post Telegram (HTML + emoji)
   │   │   ├─ services/marketData.js      → fetch OHLCV dari Twelve Data API
+  │   │   ├─ services/newsService.js     → sync kalender ekonomi & jadwal alert berita
   │   │   ├─ content/topics.js           → pilih topik & tracking cooldown
   │   │   ├─ bot.js                      → kirim ke Telegram
   │   │   └─ utils/contentLog.js         → catat riwayat per grup
@@ -75,7 +77,7 @@ src/index.js
   └─ src/admin.js               → setup Telegram command handlers
       ├─ admin/auth.js           → verifikasi admin + rate limiting
       ├─ admin/commands.js       → implementasi command (multi-grup aware)
-      └─ admin/preview.js        → pending posts (2-langkah: preview → post)
+      └─ admin/preview.js        → pending posts (2-langkah: preview → confirm, timeout 60 detik)
 ```
 
 ---
@@ -94,7 +96,7 @@ src/index.js
 
 ## Konten: Dua Pipeline Terpisah
 
-**1. Konten Marketing** (`content/generator.js`): Edukasi, produk, tip, intro, newsletter, signal, risk management, psychology. Semua menggunakan `generateContentWithRetry()`. Topik diambil via `getNextTopic()` yang tracking cooldown 14 hari per grup di `data/content-log.json`.
+**1. Konten Marketing** (`content/generator.js`): Edukasi, produk, tip, intro, newsletter, signal, risk management, psychology. Semua menggunakan `generateContentWithRetry()`. Topik diambil via `getNextTopic()` yang tracking cooldown 14 hari per grup di `data/logs/{groupId}-content-log.json`.
 
 **2. Analisis Teknikal** (`content/analysisGenerator.js` + `services/marketData.js`): Fetch data OHLCV dari Twelve Data API (symbol mapping: `XAUUSD` → `XAU/USD`), generate analisis objektif via AI. **Analisis bypass daily post limit** — dihitung terpisah. Membutuhkan `TWELVE_DATA_API_KEY`.
 
@@ -105,10 +107,12 @@ src/index.js
 | File | Isi |
 |---|---|
 | `data/groups.json` | Konfigurasi semua grup (multi-grup mode) |
-| `data/content-log.json` | Riwayat konten + cooldown topik per grup |
+| `data/logs/{groupId}-content-log.json` | Riwayat konten + cooldown topik per grup (primary) |
+| `data/content-log.json` | Legacy global log — masih ditulis tapi bukan sumber cooldown |
 | `data/admin-log.json` | Audit log aksi admin (maks 1000 entri) |
 | `data/scheduler-state-{groupId}.json` | Pause state per grup (persisted across restart) |
 | `data/today-news.json` | Berita ekonomi hari ini dari Forex Factory |
+| `data/news-log.json` | Tracking berita yang sudah dikirim (mencegah duplikasi) |
 | `data/weekly-highlights.json` | Input manual untuk newsletter mingguan |
 
 ---
@@ -147,6 +151,8 @@ Prompt AI dirancang ketat untuk **menghindari**: garansi profit, taktik FOMO/urg
 
 `admin/commands.js` menyimpan session per-chat di `adminSessions` Map (`chatId → { selectedGroupId }`). Jika hanya ada 1 grup, auto-select. Jika 2+ grup, admin harus pilih grup dulu via inline keyboard sebelum menjalankan command apapun.
 
+Admin commands yang tersedia: `/admin` (menu utama), `/status`, `/stats`, `/health`, `/pause`, `/resume`, `/trigger` (post manual dengan preview), `/post` (trigger langsung), `/schedule` (lihat jadwal), `/settime` (ubah cron per tipe), `/preview` (ulang preview terakhir).
+
 ---
 
 ## Catatan Penting
@@ -157,3 +163,6 @@ Prompt AI dirancang ketat untuk **menghindari**: garansi profit, taktik FOMO/urg
 - **Logger:** `src/logger.js` hanya re-export `src/utils/logger.js` (Winston + daily-rotate)
 - **Topik konten hardcoded:** `src/content/topics.js` — perlu redeploy untuk ubah topik default
 - **Schedule hotswap:** `/settime` command memanggil `stopScheduler()` + `startScheduler()` untuk apply perubahan cron tanpa restart
+- **OpenAI:** `gpt-4o-mini`, `max_tokens=1000`. Retry khusus 429: OpenAI tunggu 60 detik, Telegram pakai `retry_after` dari response header
+- **Tidak ada test suite** — hanya ESLint (`npm run lint`). Tidak ada Jest/Mocha/testing framework di project ini
+- **Error budget:** Sliding window 1 jam, limit 5 error — implementasi di `utils/monitor.js::ErrorMonitor`
